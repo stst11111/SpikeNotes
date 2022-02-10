@@ -81,6 +81,37 @@ Export1，Export2...：这个就是 __资源包内具体对象序列化后的二
 3.加载所有的Export对象并序列化，这一步有IO
 4.执行PostLoad，并把对象加入引擎管理，完成加载
 
+### 概念介绍
+
+#### 1. 基础概念
+
+了解加载过程前必须先了解UPackage、uasset文件格式、FLinkerLoad三个基本概念，一个资源在文件中对应uasset，在内存中对应为UPackage，而FLinkerLoad是作为uasset和内存UPackage的中间桥梁。
+
+UPackage：
+    一个资源在内存中表现为一个UPackage的实例，对于UPackage底下的UObject来说，UPackage是UObject的Outer。要知道资源自身数据UObject的内容，必须先知道UPackage才行。
+
+uasset文件格式:
+    File Summary 文件头信息
+    Name Table 包中对象的名字表
+    Import Table 存放被该包中对象引用的其它包中的对象信息(路径名和类型)
+    Export Table 该包中的对象信息(路径名和类型)
+    Export Objects 所有Export Table中对象的实际数据。
+两个UPackage实例存在依赖关系，序列化到uasset文件的时候，这些依赖关系就存储为ImportTable。可以把ImportTable看做是这个资源所依赖的其他资源的列表，ExportTable就是这个资源本身的列表。 Export Objects 所有Export Table中对象的实际数据。
+
+FLinkerLoad:
+    在加载内容生成UPackage的时候，UPackage会根据名字找到uasset文件，由FLinkerLoad来负责加载。FLinkerLoad主要内容如下：
+
+``` c++
+    FArchive* Loader;//具体加载的loader
+    TArray<FObjectImport> ImportMap;
+    TArray<FObjectExport> ExportMap;
+    TArray<TArray<FPackageIndex> > DependsMap;//自身exports所被依赖的pkg
+```
+
+//FObjectExport是这个UPackage所拥有的UObject(这些UObject都能提供给其他UPackage作为Import)
+
+#### 2. EDL节点
+
 ``` c++
 /** [EDL] Event Load Node */
 enum class EEventLoadNode
@@ -103,7 +134,10 @@ enum class EEventLoadNode
 };
 ```
 
+介绍一下优先级队列
+
 ``` c++
+//EDL的优先级队列
 struct FAsyncLoadEventQueue
 {
     int32 RunningSerialNumber;
@@ -115,7 +149,7 @@ struct FAsyncLoadEventQueue
         //构造FAsyncLoadEvent，加载请求入堆，维护大根堆，优先级大的先执行
         EventQueue.HeapPush(FAsyncLoadEvent(UserPriority, PackageSerialNumber, EventSystemPriority, ++RunningSerialNumber, Forward<TFunction<void(FAsyncLoadEventArgs& Args)>>(Payload)));
     }
-    //出堆
+    //出堆执行Payload
     bool PopAndExecute(FAsyncLoadEventArgs& Args)
     {
         FAsyncLoadEvent Event;
@@ -125,31 +159,17 @@ struct FAsyncLoadEventQueue
     }
 };
 
+//EDL加载事件
+//成员没有FAsyncPackage，具体的FAsyncPackage通过lambda的捕获列表传入
 struct FAsyncLoadEvent
 {
-    //用于比较的优先级
+    //用于比较的优先级，依次比较
     int32 UserPriority;
     int32 EventSystemPriority;
     int32 PackageSerialNumber;
     int32 SerialNumber;
+    //Event真正执行的函数
     TFunction<void(FAsyncLoadEventArgs& Args)> Payload;
-
-    FORCEINLINE bool operator<(const FAsyncLoadEvent& Other) const
-    {
-        if (UserPriority != Other.UserPriority)
-        {
-            return UserPriority > Other.UserPriority;
-        }
-        if (EventSystemPriority != Other.EventSystemPriority)
-        {
-            return EventSystemPriority > Other.EventSystemPriority;
-        }
-        if (PackageSerialNumber != Other.PackageSerialNumber)
-        {
-            return PackageSerialNumber > Other.PackageSerialNumber; // roughly DFS
-        }
-        return SerialNumber < Other.SerialNumber;
-    }
 }
 ```
 
@@ -219,7 +239,7 @@ LoadPackage
 int32 FAsyncLoadingThread::LoadPackage(const FString& InName, const FGuid* InGuid, const TCHAR* InPackageToLoadFrom, FLoadPackageAsyncDelegate InCompletionDelegate, EPackageFlags InPackageFlags, int32 InPIEInstanceID, int32 InPackagePriority, const FLinkerInstancingContext* InstancingContext)
 {
     ... ...
-    //全局广播给业务层
+    //广播给业务层
     if ( FCoreDelegates::OnAsyncLoadPackage.IsBound() )
     {
         FCoreDelegates::OnAsyncLoadPackage.Broadcast(InName);
@@ -228,26 +248,19 @@ int32 FAsyncLoadingThread::LoadPackage(const FString& InName, const FGuid* InGui
     RequestID = IAsyncPackageLoader::GetNextRequestId();
     TRACE_LOADTIME_BEGIN_REQUEST(RequestID);
     AddPendingRequest(RequestID);
-    //构造PackageDesc，添加请求到加载队列
+    //构造异步加载请求的描述
     FAsyncPackageDesc PackageDesc(RequestID, *PackageName, *PackageNameToLoad, InGuid ? *InGuid : FGuid(), MoveTemp(CompletionDelegatePtr), InPackageFlags, InPIEInstanceID, InPackagePriority);
     if (InstancingContext)
     {
         PackageDesc.SetInstancingContext(*InstancingContext);
     }
+    //添加请求到加载队列
     QueuePackage(PackageDesc);
 }
 
+//加载请求入队
 void FAsyncLoadingThread::QueuePackage(FAsyncPackageDesc& Package)
 {
-    if(CheckForFilePackageOpenLogCommandLine())
-    {
-        FPlatformFileOpenLog* PlatformFileOpenLog = (FPlatformFileOpenLog*)(FPlatformFileManager::Get().FindPlatformFile(FPlatformFileOpenLog::GetTypeName()));
-        if (PlatformFileOpenLog != nullptr)
-        {
-            PlatformFileOpenLog->AddPackageToOpenLog(*Package.Name.ToString());
-        } 
-    }
-
     QueuedPackagesCounter.Increment();
     QueuedPackages.Add(new FAsyncPackageDesc(Package, MoveTemp(Package.PackageLoadedDelegate)));
 
@@ -282,6 +295,8 @@ EAsyncPackageState::Type FAsyncLoadingThread::TickAsyncThread(bool bUseTimeLimit
                 Result = ProcessAsyncLoading(ProcessedRequests, bUseTimeLimit, bUseFullTimeLimit, RemainingTimeLimit, FlushTree);
                 bDidSomething = bDidSomething || ProcessedRequests > 0;
             }
+        }
+    }
 }
 
 //接1
@@ -320,19 +335,46 @@ int32 FAsyncLoadingThread::CreateAsyncPackagesFromQueue(bool bUseTimeLimit, bool
     }
 }
 
+//1.1
+void FAsyncLoadingThread::ProcessAsyncPackageRequest(FAsyncPackageDesc* InRequest, FAsyncPackage* InRootPackage, FFlushTree* FlushTree)
+{
+    //查看1.是否已经在加载队列中，2.是否已加载，3.是否已加载待处理
+    FAsyncPackage* Package = FindExistingPackageAndAddCompletionCallback(InRequest, AsyncPackageNameLookup, FlushTree);
+    if (!Package) Package = FindExistingPackageAndAddCompletionCallback(InRequest, LoadedPackagesNameLookup, FlushTree);
+    if (!Package) Package = FindExistingPackageAndAddCompletionCallback(InRequest, LoadedPackagesToProcessNameLookup, FlushTree);
+    //否则新建并
+    if (!Package)
+    {
+        Package = new FAsyncPackage(*this, *InRequest, EDLBootNotificationManager);
+        //回调从desc挪到AsyncPackage
+        Package->AddCompletionCallback(MoveTemp(InRequest->PackageLoadedDelegate), false);
+        //把自己和import依赖的package全都加进FlushTree->PackagesToFlush
+        Package->PopulateFlushTree(FlushTree);
+        //插入到等待列表
+        InsertPackage(Package, false, EAsyncPackageInsertMode::InsertAfterMatchingPriorities);
+        QueuedPackagesCounter.Decrement();
+        NotifyAsyncLoadingStateHasMaybeChanged();
+    }
+}
+
 //1.1，把QueueCopy中的FAsyncPackageDesc转为FAsyncPackage，CreateLinker开始正式加载流程
 void FAsyncLoadingThread::InsertPackage(FAsyncPackage* Package, bool bReinsert, EAsyncPackageInsertMode InsertMode)
 {
     //EDL
     if (GEventDrivenLoaderEnabled)
     {
+        //通过权重排序插入到AsyncPackages，并添加到查找列表AsyncPackageNameLookup，表示完成预加载
         AsyncPackages.Add(Package);
         AsyncPackageNameLookup.Add(Package->GetPackageName(), Package);
-        //正式开始EDL流程，向FAsyncLoadingThread::EventQueue中加一个Event
+        //1.1.1正式开始EDL流程，向FAsyncLoadingThread::EventQueue中加一个Event
         QueueEvent_CreateLinker(Package, FAsyncLoadEvent::EventSystemPriority_MAX);
-        {//QueueEvent_CreateLinker()
-
-            //EventQueue是FAsyncLoadEvent的优先级队列，添加event
+        {//QueueEvent_CreateLinker()实现：
+            //在静态的FAsyncPackage::GlobalEventGraph中添加
+            Package->AddNode(EEventLoadNode::Package_LoadSummary);
+            FWeakAsyncPackagePtr WeakPtr(Package);
+            TAsyncLoadPriority UserPriority = Package->GetPriority();
+            int32 PackageSerialNumber = GRandomizeLoadOrder ? GetRandomSerialNumber() : Package->SerialNumber;
+            //EventQueue是FAsyncLoadEvent的优先级队列，构造并添加FAsyncLoadEvent，等执行到时调用下面函数
             EventQueue.AddAsyncEvent(UserPriority, PackageSerialNumber, EventSystemPriority,
             TFunction<void(FAsyncLoadEventArgs& Args)>(
                 [WeakPtr, this](FAsyncLoadEventArgs& Args)
@@ -350,6 +392,61 @@ void FAsyncLoadingThread::InsertPackage(FAsyncPackage* Package, bool bReinsert, 
     }
 }
 
+//1.1.1
+void FAsyncPackage::Event_CreateLinker()
+{
+    //...记录start time
+    //在自己EventNodeArray中找到Package_LoadSummary这个EventNode，并把bFired标记为true
+    NodeWillBeFiredExternally(EEventLoadNode::Package_LoadSummary);
+    CreateLinker();//实现如下
+    {
+        //1.根据资源文件名创建一个空的UPackage，并添加引用防止被释放掉
+        UPackage* Package = CreatePackage(*Desc.Name.ToString());
+        AddObjectReference(Package);
+
+        //2.创建linker
+        Linker = FLinkerLoad::FindExistingLinkerForPackage(Package);
+        if (!Linker)
+        {
+            if (GEventDrivenLoaderEnabled)
+            {
+                FWeakAsyncPackagePtr WeakPtr(this);
+                FPrecacheCallbackHandler* PrecacheHandler = &AsyncLoadingThread.GetPrecacheHandler();
+                //异步创建Linker，包括初始化Loader
+                Linker = FLinkerLoad::CreateLinkerAsync(LoadContext, Package, *PackageFileName, LinkerFlags, Desc.GetInstancingContext()
+                    , TFunction<void()>(
+                        [WeakPtr, PrecacheHandler]()
+                        {
+                            PrecacheHandler->SummaryComplete(WeakPtr);
+                        }
+                    ));
+                if (Linker)
+                {
+                    AsyncLoadingThread.GetPrecacheHandler().RegisterNewSummaryRequest(this);
+                    AsyncLoadingThread.GetPrecacheHandler().SummaryComplete(WeakPtr);
+                }
+            }
+            else
+            {
+                Linker = FLinkerLoad::CreateLinkerAsync(LoadContext, Package, *PackageFileName, LinkerFlags, Desc.GetInstancingContext(), TFunction<void()>([]() {}));
+            }
+        }
+    }
+    check(AsyncPackageLoadingState == EAsyncPackageLoadingState::NewPackage);
+    if (Linker)
+    {
+        AsyncPackageLoadingState = EAsyncPackageLoadingState::WaitingForSummary;
+        Linker->bLockoutLegacyOperations = true;
+    }
+    else
+    {
+        RemoveNode(EEventLoadNode::Package_LoadSummary);
+        EventDrivenLoadingComplete();
+        AsyncPackageLoadingState = EAsyncPackageLoadingState::PostLoad_Etc;
+        check(!AsyncLoadingThread.AsyncPackagesReadyForTick.Contains(this));
+        AsyncLoadingThread.AsyncPackagesReadyForTick.Add(this);
+    }
+}
 //2.
 EAsyncPackageState::Type FAsyncLoadingThread::ProcessAsyncLoading(int32& OutPackagesProcessed, bool bUseTimeLimit /*= false*/, bool bUseFullTimeLimit /*= false*/, float TimeLimit /*= 0.0f*/, FFlushTree* FlushTree)
 {
