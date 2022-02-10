@@ -484,11 +484,7 @@ EAsyncPackageState::Type FAsyncLoadingThread::ProcessAsyncLoading(int32& OutPack
 接下来具体介绍UPackage的结构以及通过FLinkerLoad加载的具体流程。
 资源在文件夹中对应uasset，在内存中对应为UPackage。
 UPackage序列化到本地之后就是uasset文件，uasset是本地的资源文件。包括如下：
-    File Summary 文件头信息
-    Name Table 包中对象的名字表
-    Import Table 存放被该包中对象引用的其它包中的对象信息(路径名和类型)
-    Export Table 该包中的对象信息(路径名和类型)
-    Export Objects 所有Export Table中对象的实际数据。
+
 两个UPackage实例存在依赖关系，序列化到uasset文件的时候，这些依赖关系就存储为ImportTable。可以把ImportTable看做是这个资源所依赖的其他资源的列表，ExportTable就是这个资源本身的列表。 Export Objects 所有Export Table中对象的实际数据。
 
 ``` c++
