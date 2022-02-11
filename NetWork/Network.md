@@ -25,7 +25,9 @@ Bunch 序列号是每个通道的，每发送一个可靠 Bunch 就递增它的 
 ## Bunch可靠传输过程简述
 
 接下来介绍一下UE4底层网络包如何实现可靠性。
-——————发端——————
+
+### 发端
+
 1.`UChannel::SendBunch`:首先channel和可靠性相同，并且允许合并的小bunch可以合并，节省bunch头部的消耗。然后需要将过大的的Bunch切分成partial bunch，并且把处理过的bunch放到OutgoingBunches中。经过合并切分处理的bunch，暂且称之为raw bunch，接下来可靠也是建立在raw bunch这一层面上的。
 接下来遍历OutgoingBunches，同步partial信息用于收端还原完整bunch，通过PrepBunch给raw bunch分配ChSequence，相当于是raw bunch递增的序列号。若可靠，需要塞到OutRec的末尾，用于在丢包的时候重新发送。
 通过SendRawBunch将所有的raw bunch添加头部信息再发出去，并且记录PacketId的范围并返回（原始bunch可能会拆分到不同的packet）。
@@ -33,7 +35,9 @@ Bunch 序列号是每个通道的，每发送一个可靠 Bunch 就递增它的 
 2.`UNetConnection::SendRawBunch`：为raw bunch建立头部，包括Reliable、Partial等信息，把头部和bunch的数据都push到SendBuffer（WriteBitsToSendBufferInternal），记录并返回PacketId。
 FlushNet的时候就会把SendBuffer中的数据通过LowLevelSend发出去。
 e.g.  pkt1 |A|B1|   pkt2|B2|C|   pkt3|D|
-——————收端——————
+
+### 收端
+
 3.`UNetConnection::ReceivedRawPacket`：此时收端通过StatelessConnectHandlerComponent::Incoming处理握手、校验、加密、压缩（并没有看懂），解析并构造FBitReader，在ReceivedPacket中真正处理Packet。
 
 4.`UNetConnection::ReceivedPacket`:首先，通过ReadHeader解析Packet中的包头，通过包头的序列号减去上次收包的序列号得出packet序列号增量，判断有没有丢包、是否由于底层的原因收到了历史的包(丢弃即可)。
@@ -68,7 +72,8 @@ UNetConnection::ReceivedPacket(...)
 }
 ```
 
-——————发端——————
+### 发端处理rpc
+
 8.`FNetPacketNotify::ProcessReceivedAcks`：ack信息回到发端
 
 ``` c++

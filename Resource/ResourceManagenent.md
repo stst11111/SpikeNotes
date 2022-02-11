@@ -232,6 +232,8 @@ struct FEventLoadNode
 
 ### 加载流程源码分析
 
+![a](./Img/img01.png)
+
 LoadPackage
 添加加载请求到QueuedPackages : TArray<FAsyncPackageDesc*>
 
@@ -290,7 +292,7 @@ EAsyncPackageState::Type FAsyncLoadingThread::TickAsyncThread(bool bUseTimeLimit
             }
             else
             {
-                //2.pop出EventQueue中的event
+                //2.继续
                 FGCScopeGuard GCGuard;
                 Result = ProcessAsyncLoading(ProcessedRequests, bUseTimeLimit, bUseFullTimeLimit, RemainingTimeLimit, FlushTree);
                 bDidSomething = bDidSomething || ProcessedRequests > 0;
@@ -392,7 +394,7 @@ void FAsyncLoadingThread::InsertPackage(FAsyncPackage* Package, bool bReinsert, 
     }
 }
 
-//1.1.1
+//1.1.1新建Package，读取summary
 void FAsyncPackage::Event_CreateLinker()
 {
     //...记录start time
@@ -417,6 +419,8 @@ void FAsyncPackage::Event_CreateLinker()
                     , TFunction<void()>(
                         [WeakPtr, PrecacheHandler]()
                         {
+                            //这里加载完了summary，会把该FWeakAsyncPackagePtr放到PrecacheHandler->IncomingSummaries中
+                            //接下来通过ProcessIncoming处理
                             PrecacheHandler->SummaryComplete(WeakPtr);
                         }
                     ));
@@ -447,13 +451,17 @@ void FAsyncPackage::Event_CreateLinker()
         AsyncLoadingThread.AsyncPackagesReadyForTick.Add(this);
     }
 }
-//2.
+
+//2.继续处理异步加载
 EAsyncPackageState::Type FAsyncLoadingThread::ProcessAsyncLoading(int32& OutPackagesProcessed, bool bUseTimeLimit /*= false*/, bool bUseFullTimeLimit /*= false*/, float TimeLimit /*= 0.0f*/, FFlushTree* FlushTree)
 {
     if (GEventDrivenLoaderEnabled)
     {
         while (true)
         {
+            //首先处理刚刚收集的已完成summary加载的FWeakAsyncPackagePtr，全部调用QueueEvent_FinishLinker，接下来进入FinishLinker的阶段
+            bDidSomething = GetPrecacheHandler().ProcessIncoming();
+
             const float RemainingTimeLimit = FMath::Max(0.0f, TimeLimit - (float)(FPlatformTime::Seconds() - TickStartTime));
             int32 NumCreated = CreateAsyncPackagesFromQueue(bUseTimeLimit, bUseFullTimeLimit, RemainingTimeLimit);
             OutPackagesProcessed += NumCreated;
@@ -475,18 +483,24 @@ EAsyncPackageState::Type FAsyncLoadingThread::ProcessAsyncLoading(int32& OutPack
                 bDidSomething = true;
             }
         }
-
+        
     }
 }
 
 ```
+
+阶段2：
+
+``` c++
+void FAsyncPackage::Event_FinishLinker()
+{
+
+}
+```
+
 
 接下来具体介绍UPackage的结构以及通过FLinkerLoad加载的具体流程。
 资源在文件夹中对应uasset，在内存中对应为UPackage。
 UPackage序列化到本地之后就是uasset文件，uasset是本地的资源文件。包括如下：
 
 两个UPackage实例存在依赖关系，序列化到uasset文件的时候，这些依赖关系就存储为ImportTable。可以把ImportTable看做是这个资源所依赖的其他资源的列表，ExportTable就是这个资源本身的列表。 Export Objects 所有Export Table中对象的实际数据。
-
-``` c++
-
-```
