@@ -340,7 +340,7 @@ int32 FAsyncLoadingThread::CreateAsyncPackagesFromQueue(bool bUseTimeLimit, bool
 //1.1
 void FAsyncLoadingThread::ProcessAsyncPackageRequest(FAsyncPackageDesc* InRequest, FAsyncPackage* InRootPackage, FFlushTree* FlushTree)
 {
-    //查看1.是否已经在加载队列中，2.是否已加载，3.是否已加载待处理
+    //查看1.是否已经在加载队列中，2.是否已加载，3.是否已加载待处理(主线程将异步线程加载完毕的package复制)
     FAsyncPackage* Package = FindExistingPackageAndAddCompletionCallback(InRequest, AsyncPackageNameLookup, FlushTree);
     if (!Package) Package = FindExistingPackageAndAddCompletionCallback(InRequest, LoadedPackagesNameLookup, FlushTree);
     if (!Package) Package = FindExistingPackageAndAddCompletionCallback(InRequest, LoadedPackagesToProcessNameLookup, FlushTree);
@@ -485,19 +485,137 @@ EAsyncPackageState::Type FAsyncLoadingThread::ProcessAsyncLoading(int32& OutPack
         }
         
     }
+    else if(AsyncPackages.Num())//非EDL模式
+    {
+        //遍历
+        for (int32 PackageIndex = 0; ((bDepthFirst && LoadingState == EAsyncPackageState::Complete) || (!bDepthFirst && LoadingState != EAsyncPackageState::TimeOut)) && PackageIndex < AsyncPackages.Num(); ++PackageIndex)
+        {
+            FAsyncPackage* Package = AsyncPackages[PackageIndex];
+            if (FlushTree && !FlushTree->Contains(Package->GetPackageName()))
+            {
+                LoadingState = EAsyncPackageState::PendingImports;
+            }
+            else if (Package->HasFinishedLoading() == false)
+            {
+                if (GEventDrivenLoaderEnabled)
+                {
+                    LoadingState = EAsyncPackageState::PendingImports;
+                }
+                else
+                {
+                    //对每个AsyncPackage执行CreateLinker、FinishLinker、LoadImports、CreateImports、CreateExports、PreLoadObjects、CallCompletionCallbacks、PostLoadObjects等等
+                    LoadingState = Package->TickAsyncPackage(bUseTimeLimit, bUseFullTimeLimit, TimeLimit, FlushTree);
+                }
+            }
+        }
+    }
+
 }
 
 ```
 
-阶段2：
+阶段2：FinishLinker
 
 ``` c++
 void FAsyncPackage::Event_FinishLinker()
 {
+    EAsyncPackageState::Type Result = EAsyncPackageState::Complete;
+    if (Linker && !Linker->HasFinishedInitialization())
+    {
+        const float RemainingTimeLimit = TimeLimit - (float)(FPlatformTime::Seconds() - TickStartTime);
+        //1.序列化资源summary信息
+        FLinkerLoad::ELinkerStatus LinkerResult = Linker->Tick(RemainingTimeLimit, bUseTimeLimit, bUseFullTimeLimit, &ObjectNameWithOuterToExport);
+    }
+    return Result;
+}
 
+```
+
+阶段3：LoadImports
+功能：保证每个引用的Import
+1.创建了TAsyncPackage，加入队列
+2.执行到队列创建UPackage
+3.创建FLinkerLoad并且已经FinishLinker
+也就是说所有Imports都已经FinishLinker了
+
+``` c++
+EAsyncPackageState::Type FAsyncPackage::LoadImports(FFlushTree* FlushTree)
+{
+    // 遍历所有ImportMap并创建UPackage
+    while (LoadImportIndex < Linker->ImportMap.Num() && !IsTimeLimitExceeded())
+    {
+        //取到名字
+        FObjectImport* Import = &Linker->ImportMap[LoadImportIndex++];
+        FName ImportPackageFName = Linker->GetInstancingContext().Remap(ImportToLoad);
+        //先查查有没有创建UPackage
+        UPackage* ExistingPackage = dynamic_cast<UPackage*>(StaticFindObjectFast(UPackage::StaticClass(), nullptr, ImportPackageFName, true));
+
+        //已经全部创建，所有exports都已创建
+        if (ExistingPackage && !ExistingPackage->bHasBeenFullyLoaded && !IsNativeCodePackage(ExistingPackage))
+        {
+            FLinkerLoad* PendingPackageLinker = PendingPackage->Linker;
+            if (PendingPackageLinker == nullptr || !PendingPackageLinker->HasFinishedInitialization())
+            {
+                //linker的加载已经结束，添加到PendingImportedPackages.
+                AddUniqueLinkerDependencyPackage(*PendingPackage, FlushTree);
+            }
+            else
+            {
+                //添加引用
+                PendingPackage->DependencyRefCount.Increment();
+                ReferencedImports.Add(PendingPackage);
+                //递归，把
+                TSet<FAsyncPackage*> SearchedPackages;
+                AddDependencyTree(*PendingPackage, SearchedPackages, FlushTree);
+            }
+        }
+
+        //没创建并且不在PendingImportedPackages数组中
+        if (!ExistingPackage && ContainsDependencyPackage(PendingImportedPackages, ImportPackageFName) == INDEX_NONE)
+        {
+            const FString ImportPackageName(ImportPackageFName.ToString());
+            //创建FAsyncPackage插入到队列中（AsyncLoadingThread.InsertPackage）
+            AddImportDependency(ImportPackageFName, ImportToLoad, FlushTree, InstancingContext);
+        }
+    }
+}
+
+void FAsyncPackage::AddImportDependency(const FName& PendingImport, const FName& PackageToLoad, FFlushTree* FlushTree, FLinkerInstancingContext InstancingContext)
+{
+    FAsyncPackage* PackageToStream = AsyncLoadingThread.FindAsyncPackage(PendingImport);
+    const bool bReinsert = PackageToStream != nullptr;
+    //如果PendingImport没有对应FAsyncPackage用于加载，创建并且插入到加载队列
+    if (!PackageToStream)
+    {
+        FAsyncPackageDesc Info(INDEX_NONE, PendingImport, PackageToLoad);
+        Info.SetInstancingContext(MoveTemp(InstancingContext));
+        PackageToStream = new FAsyncPackage(AsyncLoadingThread, Info, EDLBootNotificationManager);
+        //创建FAsyncPackage插入到队列中
+        AsyncLoadingThread.InsertPackage(PackageToStream, bReinsert);
+    }
+
+    //如果还没加载完，放入到PendingImportedPackages中
+    if (!PackageToStream->HasFinishedLoading() && !PackageToStream->bLoadHasFailed)
+    {
+        const bool bInternalCallback = true;
+        TUniquePtr<FLoadPackageAsyncDelegate> InternalDelegate = MakeUnique<FLoadPackageAsyncDelegate>(FLoadPackageAsyncDelegate::CreateRaw(this, &FAsyncPackage::ImportFullyLoadedCallback));
+        PackageToStream->AddCompletionCallback(MoveTemp(InternalDelegate), bInternalCallback);
+        PackageToStream->DependencyRefCount.Increment();
+        PendingImportedPackages.Add(PackageToStream);
+        //递归，把import下依赖的PendingImportedPackages都放到FlushTree
+        if (FlushTree) PackageToStream->PopulateFlushTree(FlushTree);
+    }
+    else
+    {
+        //ReferencedImports：已经加载好的引用的Imports
+        PackageToStream->DependencyRefCount.Increment();
+        ReferencedImports.Add(PackageToStream);
+    }
 }
 ```
 
+阶段4：CreateImports
+给fimport
 
 接下来具体介绍UPackage的结构以及通过FLinkerLoad加载的具体流程。
 资源在文件夹中对应uasset，在内存中对应为UPackage。

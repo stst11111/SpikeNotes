@@ -72,7 +72,7 @@ UNetConnection::ReceivedPacket(...)
 }
 ```
 
-### 发端处理rpc
+### 发端处理ack/nak
 
 8.`FNetPacketNotify::ProcessReceivedAcks`：ack信息回到发端
 
@@ -159,12 +159,12 @@ FNetPacketNotify::ProcessReceivedAcks
 //UNetDriver::TickFlush()调用
 int32 UNetDriver::ServerReplicateActors(float DeltaSeconds)
 {
-    // 获取需要参加网络同步的Actor
+    //1.遍历NetworkObjectList，获取需要参加网络同步的Actor，检查是否达到下次更新时间ActorInfo->NextUpdateTime
     ServerReplicateActors_BuildConsiderList( GetNetworkObjectList(), ConsiderList, ServerTickTime, true );
     //遍历所有connection
     for ( int32 i=0; i < ClientConnections.Num(); i++ )
     {
-        //1.获取该conn所有的viewer（包含char&controller）
+        //获取该conn所有的viewer（包含char&controller）
         TArray& ConnectionViewers = WorldSettings->ReplicationViewers;
         ConnectionViewers.Reset();
         new( ConnectionViewers )FNetViewer( Connection, DeltaSeconds );
@@ -178,6 +178,16 @@ int32 UNetDriver::ServerReplicateActors(float DeltaSeconds)
     }
 }
 ```
+
+2.优先级排序：
+
+2.1 九宫格优化，这一步的ConsiderList是该conn同步范围内的actor，通过接口GetPerConnectionCachedConsiderList获取。
+该list通过UpdateRegionNetworkObjectLists接口在conn内部tick更新。
+首先通过UpdateRegions，通过位置和同步范围，算出进入和退出的区域。
+对于所有进入的区域，通过GetRegionNetworkObjectList获取该区域内的所有需要同步的actor，加入到RegionNetworkObjects并设置同步时间等。对于离开的区域，则从RegionNetworkObjects中remove掉，并且关闭对应channel。
+以上方法需要维护每个region中的actors，因此actor位置变动的时候需要更新。
+
+
 
 再来介绍一下ActorChannel的初始化流程。终点就是初始化RepLayout，作为类属性比较的参照。然后初始化RepState和RepChangedPropertyTracker，用于之后的属性比较。
 
