@@ -181,15 +181,17 @@ int32 UNetDriver::ServerReplicateActors(float DeltaSeconds)
 
 2.优先级排序：
 
-2.1 九宫格优化，这一步的ConsiderList是该conn同步范围内的actor，通过接口GetPerConnectionCachedConsiderList获取。
+九宫格优化，这一步的ConsiderList是该conn同步范围内的actor，通过接口GetPerConnectionCachedConsiderList获取。
 该list通过UpdateRegionNetworkObjectLists接口在conn内部tick更新。
 首先通过UpdateRegions，通过位置和同步范围，算出进入和退出的区域。
 对于所有进入的区域，通过GetRegionNetworkObjectList获取该区域内的所有需要同步的actor，加入到RegionNetworkObjects并设置同步时间等。对于离开的区域，则从RegionNetworkObjects中remove掉，并且关闭对应channel。
 以上方法需要维护每个region中的actors，因此actor位置变动的时候需要更新。
 
+3.真正同步actor，创建channel，同步actor
+通过IsNetRelevantFor判断actor和conn的相关性。
+如果没有channel，创建并SetChannelActor。
 
-
-再来介绍一下ActorChannel的初始化流程。终点就是初始化RepLayout，作为类属性比较的参照。然后初始化RepState和RepChangedPropertyTracker，用于之后的属性比较。
+3.1. 介绍一下ActorChannel的初始化流程。终点就是初始化RepLayout，作为类属性比较的参照。然后初始化RepState和RepChangedPropertyTracker，用于之后的属性比较。
 
 ``` c++
 void UActorChannel::SetChannelActor( AActor* InActor )
@@ -234,7 +236,7 @@ void FRepLayout::InitFromObjectClass( UClass * InObjectClass )
     }
 }
 
-//初始化旧状态内存的数据和RepChangedPropertyTracker
+//初始化旧状态内存的数据，创建RepChangedPropertyTracker和RepState
 void FObjectReplicator::InitRecentProperties( uint8* Source )
 {
     //1.创建属性变化跟踪器，InitChangedTracker
@@ -244,6 +246,8 @@ void FObjectReplicator::InitRecentProperties( uint8* Source )
     RepState->RepLayout = RepLayout;
 }
 ```
+
+3.2. ReplicateActor
 
 ## 属性同步
 
