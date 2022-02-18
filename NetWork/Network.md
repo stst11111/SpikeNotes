@@ -4,17 +4,8 @@
 
 ## UE4网络基本通信架构
 
-![图片描述](/tfl/captures/2021-11/tapd_personalword_1100000000000459405_base64_1636308027_76.png)
+![a](./Img/img02.png)
 这是Jerish大佬画的图，基本解释了Connection和Channel的概念，Connection相当于客户端与服务器实际的会话连接，Channel相当于同步具体Actor、Controller信息的通道。
-![图片描述](/tfl/captures/2021-12/tapd_personalword_1100000000000459405_base64_1639130701_12.png)
-
-### 数据传输
-
-Packets 是在Connection上发送的数据块。
-Bunches 是在Channel上发送的数据块。
-一个 Packet 可以不包含 Bunch、单个 Bunch 或者多个 Bunch。当一个 Bunch 太大时，在传输之前，我们会把它切成许多小 Bunch，这些 Bunch 将被标记为 PartialInitial, Partial 或 PartialFinal。利用这些信息，我们可以在接收端重新组装 Bunch。
-Bunch 序列号是每个通道的，每发送一个可靠 Bunch 就递增它的 Bunch 序列号。当Bunch需要重传时，将重新发送具有相同 Bunch 序列号的 Bunch，而Packet是每次都重新组装的，不会缓存Packet重发。
-这也就说明 __可靠性是在Bunch这一层面上的__ 。
 
 了解了ue4网络同步的基本架构，大致可以自顶向下分为三大部分。
 
@@ -24,6 +15,11 @@ Bunch 序列号是每个通道的，每发送一个可靠 Bunch 就递增它的 
 
 ## Bunch可靠传输过程简述
 
+Packets 是在Connection上发送的数据块。
+Bunches 是在Channel上发送的数据块。
+一个 Packet 可以不包含 Bunch、单个 Bunch 或者多个 Bunch。当一个 Bunch 太大时，在传输之前，我们会把它切成许多小 Bunch，这些 Bunch 将被标记为 PartialInitial, Partial 或 PartialFinal。利用这些信息，我们可以在接收端重新组装 Bunch。
+Bunch 序列号是每个通道的，每发送一个可靠 Bunch 就递增它的 Bunch 序列号。当Bunch需要重传时，将重新发送具有相同 Bunch 序列号的 Bunch，而Packet是每次都重新组装的，不会缓存Packet重发。
+这也就说明 __可靠性是在Bunch这一层面上的__ 。
 接下来介绍一下UE4底层网络包如何实现可靠性。
 
 ### 发端
@@ -153,6 +149,19 @@ FNetPacketNotify::ProcessReceivedAcks
 
 ## Actor同步流程
 
+概念介绍：
+![a](./Img/img01.jpg)img
+
+__FObjectReplicator__ 属性同步的执行器，每个Actorchannel对应一个FObjectReplicator，每一个FObjectReplicator对应一个对象实例。设置ActorChannel通道的时候会创建出来。
+
+__FRepState__ 针对每个连接同步的历史数据，记录同步前用于比较的Object对象信息，存在于FObjectReplicator里面。
+
+__FRepLayOut__ 同步的属性布局表，记录所有当前类需要同步的属性，每个类或者RPC函数有一个。
+
+__FRepChangedPropertyTracker__ 属性变化轨迹记录，一般在同步Actor前创建，Actor销毁的时候删掉。
+
+__FReplicationChangelistMgr__ 存放当前的Object对象，使用环形缓冲区，保存属性的变化历史记录。位置不够时合并最旧的记录，主要用于nak时resend之前记录的属性。
+
 下面是NetDriver每帧获取需要同步的Actor，并判断相关性，给每个client connection同步过去的过程。
 
 ```  c++
@@ -247,21 +256,77 @@ void FObjectReplicator::InitRecentProperties( uint8* Source )
 }
 ```
 
-3.2. ReplicateActor
+3.2. UActorChannel::ReplicateActor
+有了channel了，接下来真正同步一个Actor
+
+```  c++
+bool UActorChannel::ReplicateActor()
+{
+    //1.ds开启channel时，处理初始化同步
+    if( OpenPacketId.First != INDEX_NONE && !Connection->bResendAllDataSinceOpen )
+    {
+        if( !SpawnAcked && OpenAcked )
+        {
+            SpawnAcked = 1;
+            //收到了初始化的ack，强更所有subobject的不可靠属性
+            for (auto RepComp = ReplicationMap.CreateIterator(); RepComp; ++RepComp)
+                RepComp.Value()->ForceRefreshUnreliableProperties();
+        }
+    }
+    else
+    {
+        RepFlags.bNetInitial = true;
+        Bunch.bClose = Actor->bNetTemporary;
+        Bunch.bReliable = true; // Net temporary sends need to be reliable as well to force them to retry
+    }
+
+    if (RepFlags.bNetInitial && OpenedLocally)
+    {
+        Connection->PackageMap->SerializeNewActor(Bunch, this, Actor);
+        WroteSomethingImportant = true;
+        Actor->OnSerializeNewActor(Bunch);
+    }
+
+    //2.同步actor以及component的属性和rpc
+    WroteSomethingImportant |= ActorReplicator->ReplicateProperties(Bunch, RepFlags);
+    WroteSomethingImportant |= Actor->ReplicateSubobjects(this, &Bunch, &RepFlags);
+    //。。。这里还会处理被删除的Component
+
+    //3.发送Bunch
+    if (WroteSomethingImportant)
+    {
+        FPacketIdRange PacketRange = SendBunch( &Bunch, 1 );
+    }
+}
+
+//2：同步actor的属性和rpc
+bool FObjectReplicator::ReplicateProperties( FOutBunch & Bunch, FReplicationFlags RepFlags )
+{
+    //通过PackageMap构造序列化名字和UObject*的BitWriter
+    FNetBitWriter Writer( Bunch.PackageMap, 8192 );
+    //2.1.这里进行属性比较（RepLayout->CompareProperties），接下来介绍属性同步的时候细说
+    ChangelistMgr->Update( Object, Connection->Driver->ReplicationFrame, RepState->LastCompareIndex, RepFlags, OwningChannel->bForceCompareProperties );
+    //同步属性
+    const bool bHasRepLayout = RepLayout->ReplicateProperties( RepState, ChangelistMgr->GetRepChangelistState(), ( uint8* )Object, ObjectClass, OwningChannel, Writer, RepFlags );
+    //自定义结构同步fastarray，lua值复制
+    ReplicateCustomDeltaProperties( Writer, RepFlags );
+    //。。。resend这个connection发送过的所有信息，相当于同步与到最新的状态，可以用于回放同步到一个当前的状态
+    //不可靠rpc进队
+    if ( RemoteFunctions != NULL && RemoteFunctions->GetNumBits() > 0 )
+    {
+        Writer.SerializeBits( RemoteFunctions->GetData(), RemoteFunctions->GetNumBits() );
+        RemoteFunctions->Reset();
+        RemoteFuncInfo.Empty();
+    }
+    //把局部Writer写的东西塞到OutBunch，外部的channel一起通过SendBunch发送
+    if ( WroteImportantData )
+        OwningChannel->WriteContentBlockPayload( Object, Bunch, bHasRepLayout, Writer );
+}
+```
 
 ## 属性同步
 
-属性同步相关：
-
-__FObjectReplicator__ 属性同步的执行器，每个Actorchannel对应一个FObjectReplicator，每一个FObjectReplicator对应一个对象实例。设置ActorChannel通道的时候会创建出来。
-
-__FRepState__ 针对每个连接同步的历史数据，记录同步前用于比较的Object对象信息，存在于FObjectReplicator里面。
-
-__FRepLayOut__ 同步的属性布局表，记录所有当前类需要同步的属性，每个类或者RPC函数有一个。
-
-__FRepChangedPropertyTracker__ 属性变化轨迹记录，一般在同步Actor前创建，Actor销毁的时候删掉。
-
-__FReplicationChangelistMgr__ 存放当前的Object对象，使用环形缓冲区，保存属性的变化历史记录。位置不够时合并最旧的记录，主要用于nak时resend之前记录的属性。
+属性同步相关概念：
 
 ```  c++
 //一条同步记录
@@ -272,6 +337,7 @@ class FRepChangedHistory
     bool Resend;//是否需要重发，收到nak，判断packet id，设置重发
 }
 
+//记录同步历史的环形缓冲，用于重发属性等等
 class FRepChangelistState
 {
     FRepChangedHistory ChangeHistory[MAX_CHANGE_HISTORY];//同步记录的环形缓冲区，MAX_CHANGE_HISTORY=64
@@ -288,8 +354,6 @@ class FReplicationChangelistMgr
     FRepChangelistState RepChangelistState;
 }
 
-
-``` c++
 //属性对比用于参照的数据结构
 class FRepLayoutCmd
 {
@@ -307,13 +371,76 @@ class FRepLayoutCmd
 对比数据发送
 
 ```  c++
-class FRepLayout{
-    //对比数据进行值复制
-    ReplicateProperties
+//比较并记录
+bool FRepLayout::CompareProperties(
+    FRepChangelistState* RESTRICT RepChangelistState,
+    const uint8* RESTRICT Data,
+    const FReplicationFlags& RepFlags ) const
+{
+    //取出当前的历史数据，清空变化属性的记录
+    FRepChangedHistory& NewHistoryItem = RepChangelistState->ChangeHistory[HistoryIndex];
+    TArray<uint16>& Changed = NewHistoryItem.Changed;
+    Changed.Empty();
+    //调用比较函数，把变化的属性index记录到Changed中
+    //比较过程：遍历所有的Cmds，调用PropertiesAreIdentical查看属性是否相同
+    //如果不相同，拷贝到StaticBuffer对应位置，并且再Changed中记录变化
+    //（TArray则每个元素都执行以上过程，并且changed中添加特殊标识）
+    CompareProperties_r( 0, Cmds.Num() - 1, RepChangelistState->StaticBuffer.GetData(), Data, Changed, 0, RepFlags.bNetInitial, false );
+}
+
+//对比数据进行值复制
+bool FRepLayout::ReplicateProperties(
+    FRepState* RESTRICT RepState,
+    FRepChangelistState* RESTRICT RepChangelistState,
+    const uint8* RESTRICT Data,
+    UClass* ObjectClass,
+    UActorChannel* OwningChannel,
+    FNetBitWriter& Writer,
+    const FReplicationFlags & RepFlags ) const
+{
+
+    if (Changed.Num() > 0 || RepState->NumNaks > 0 || bFlushPreOpenAckHistory)
     {
+        RepState->HistoryEnd++;
         //如果标记了resend会统计到Changed里面
-        UpdateChangelistHistory()
+        UpdateChangelistHistory(RepState, ObjectClass, Data, OwningChannel->Connection, &Changed);
+        {//函数实现：
+            const int32 HistoryCount = RepState->HistoryEnd - RepState->HistoryStart;
+            const bool DumpHistory = HistoryCount == FRepState::MAX_CHANGE_HISTORY;
+            //从HistoryStart到HistoryEnd遍历属性发送记录
+            for ( int32 i = RepState->HistoryStart; i < RepState->HistoryEnd; i++ )
+            {
+                //如果发现HistoryItem.Resend为true，说明这次属性变化记录nak了
+                if ( AckPacketId >= HistoryItem.OutPacketIdRange.Last || HistoryItem.Resend || DumpHistory )
+                {
+                    //将这次需要resend的Changed列表，合并到现在发送的Changed
+                    if ( HistoryItem.Resend || DumpHistory )
+                    {
+                        TArray< uint16 > Temp = *OutMerged;
+                        OutMerged->Empty();
+                        MergeChangeList( Data, HistoryItem.Changed, Temp, *OutMerged );
+                        HistoryItem.Changed.Empty();
+                        if ( HistoryItem.Resend )
+                        {
+                            HistoryItem.Resend = false;
+                            RepState->NumNaks--;
+                        }
+                    }
+                    //由于已经合并，清理这次记录，HistoryStart后移
+                    HistoryItem.Changed.Empty();
+                    HistoryItem.OutPacketIdRange = FPacketIdRange();
+                    RepState->HistoryStart++;
+                }
+            }
+        }
     }
+
+    if (Changed.Num() > 0)
+    {
+        //根据Changed，序列化所有改变的属性到Writer
+        SendProperties(RepState, ChangeTracker, Data, ObjectClass, Writer, Changed, RepChangelistState->SharedSerialization);
+    }
+    
 }
 ```
 

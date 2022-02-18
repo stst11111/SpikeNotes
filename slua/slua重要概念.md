@@ -107,11 +107,11 @@ void getLuaFunctionsRecursive(lua_State* L, TSet& funcNames)
 //绑定Lua函数（向overrideFunc中添加字节码）
 bool LuaOverrider::hookBpScript(UFunction* func, UClass* cls, Native hookFunc)
 {
-    //注册字节码对应函数
+    //如果没注册，向Ex_LuaOverride字节码注册对应函数（luaOverrideFunc）
     GRegisterNative(Ex_LuaOverride, hookFunc);
     //用函数名获取子类函数
     UFunction* overrideFunc = cls->FindFunctionByName(func->GetFName(), EIncludeSuperFlag::ExcludeSuper);
-    //存在子类函数，向字节码中插入执行lua函数的字节码
+    //存在子类函数，向字节码中插入执行lua函数的字节码，uint8 Code[] = { (uint8)Ex_LuaOverride, EX_Return, EX_Nothing };
     if (overrideFunc == func)
         overrideFunc->Script.Insert(Code, sizeof(Code), 0);
     else if(!overrideFunc)
@@ -157,13 +157,13 @@ bool LuaVar::callByUFunction(UFunction* func,uint8* parms,FOutParmRec *outParams
     pSelf->push();n++;
     // 参数入栈
     for(TFieldIterator it(func);it && (it->PropertyFlags&CPF_Parm);++it) {
-          UProperty* prop = *it;
-          uint64 propflag = prop->GetPropertyFlags();
-          //...检查propflag，返回值跳过
+        UProperty* prop = *it;
+        uint64 propflag = prop->GetPropertyFlags();
+        //...检查propflag，返回值跳过
         //传入参数UProperty对象以及地址，通过对应pusher入栈
-          pushArgByParms(prop,parms+prop->GetOffset_ForInternal());
+        pushArgByParms(prop,parms+prop->GetOffset_ForInternal());
         n++;
-      }
+    }
     int remain = retCount = docall(n);
     //把栈内的返回值check到outParams
     for (TFieldIterator it(func); remain > 0 && it && (it->PropertyFlags & CPF_Parm); ++it) {
