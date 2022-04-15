@@ -2,14 +2,26 @@
 
 ![图片描述](https://pic3.zhimg.com/v2-8f66e3b2a5f4bac86fbe3f5bcaba210f_1440w.jpg?source=172ae18b)
 
+大佬们：
+quabqi手摇虚幻引擎:<https://www.zhihu.com/column/c_1358890091050606592>
+Jerish Exploring in UE4:<https://www.zhihu.com/column/c_164452593>
+南京周润发：<https://www.zhihu.com/column/c_164452593>
+
 ## 底层基础
 
 ### 对象系统
 
-### 智能指针
+#### 智能指针
 
+quabqi:
 TSharedPtr: <https://zhuanlan.zhihu.com/p/369974105>
 UObject智能指针： <https://zhuanlan.zhihu.com/p/371851019>
+
+#### GC
+
+南京周润发：
+UObject管理方式：<https://zhuanlan.zhihu.com/p/362228148>
+垃圾回收：<https://zhuanlan.zhihu.com/p/67055774>
 
 ### 多线程
 
@@ -21,15 +33,21 @@ TaskGraph: <https://zhuanlan.zhihu.com/p/408012121>
 
 ### 资源管理
 
- <https://zhuanlan.zhihu.com/p/357904199>
-
-### GC
+streamable：<https://zhuanlan.zhihu.com/p/217766701>
+资源管理：<https://zhuanlan.zhihu.com/p/357904199>
 
 ### 网络
+
+UE4可靠UDP：<https://blog.csdn.net/u012999985/article/details/117236770>
 
 Jerish三部曲：
 概念理解： <https://zhuanlan.zhihu.com/p/34721113>
 原理上： <https://zhuanlan.zhihu.com/p/34723199>
 原理下： <https://zhuanlan.zhihu.com/p/55596030>
 
+replication graph:
+<https://zhuanlan.zhihu.com/p/64427014>
+
 ### 动画
+
+### UI
