@@ -7,7 +7,7 @@ void PerformReachabilityAnalysis()
 {
     //统计序列化参与GC的对象，用于存储用于序列化uobject的array和weak reference列表。
     FGCArrayStruct* ArrayStruct = FGCArrayPool::Get().GetArrayStructFromPool();
-    TArray<UObject*>&amp; ObjectsToSerialize = ArrayStruct->ObjectsToSerialize;
+    TArray<UObject*>& ObjectsToSerialize = ArrayStruct->ObjectsToSerialize;
     //1.添加UGCObjectReferencer，添加后可用于在非UObject对象上调用AddReferencedObjects方法。
     ObjectsToSerialize.Add(FGCObject::GGCObjectReferencer);
     //2.调用MarkObjectsAsUnreachable，把所有不带KeepFlags和EInternalObjectFlags::GarbageCollectionKeepFlags标记的对象标记为不可达

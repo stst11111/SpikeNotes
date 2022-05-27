@@ -22,19 +22,31 @@ Bunch 序列号是每个通道的，每发送一个可靠 Bunch 就递增它的 
 这也就说明 __可靠性是在Bunch这一层面上的__ 。
 接下来介绍一下UE4底层网络包如何实现可靠性。
 
+要点：Partial、Reliable、
+
 ### 发端
 
-1.`UChannel::SendBunch`:首先channel和可靠性相同，并且允许合并的小bunch可以合并，节省bunch头部的消耗。然后需要将过大的的Bunch切分成partial bunch，并且把处理过的bunch放到OutgoingBunches中。经过合并切分处理的bunch，暂且称之为raw bunch，接下来可靠也是建立在raw bunch这一层面上的。
-接下来遍历OutgoingBunches，同步partial信息用于收端还原完整bunch，通过PrepBunch给raw bunch分配ChSequence，相当于是raw bunch递增的序列号。若可靠，需要塞到OutRec的末尾，用于在丢包的时候重新发送。
-通过SendRawBunch将所有的raw bunch添加头部信息再发出去，并且记录PacketId的范围并返回（原始bunch可能会拆分到不同的packet）。
+1.`UChannel::SendBunch`:
+    首先channel和可靠性相同，并且允许合并的小bunch可以合并，节省bunch头部的消耗。然后需要将过大的的Bunch切分成partial bunch，经过合并切分处理的bunch，暂且称之为raw bunch。
+    把处理过的raw bunch放到OutgoingBunches数组中。接下来可靠也是建立在raw bunch这一层面上的。
+    接下来遍历OutgoingBunches数组，同步partial信息用于收端还原完整bunch，通过PrepBunch把可靠的raw bunch塞到(FOutBunch**)OutRec链表（指向可靠待ack的outbunch链表头部）的末尾，用于在丢包的时候重新发送，并分配ChSequence（可靠的raw bunch递增的序列号）。
+    通过SendRawBunch将所有的raw bunch添加头部信息再发出去，并且记录PacketId的范围并返回（原始bunch可能会拆分到不同的packet）。
 
-2.`UNetConnection::SendRawBunch`：为raw bunch建立头部，包括Reliable、Partial等信息，把头部和bunch的数据都push到SendBuffer（WriteBitsToSendBufferInternal），记录并返回PacketId。
-FlushNet的时候就会把SendBuffer中的数据通过LowLevelSend发出去。
-e.g.  pkt1 |A|B1|   pkt2|B2|C|   pkt3|D|
+2.`UNetConnection::SendRawBunch`：
+    为raw bunch建立头部，包括Reliable、Partial等信息，以下是raw bunch头部（SendBunchHeader）主要信息（可能不会全进头部）:
+    |bOpen|Close|CloseReason|（channel开关）
+    |bIsReplicationPaused|（暂停复制）
+    |ChIndex|ChName|（通道索引与名称）
+    |bReliable|ChSequence|（可靠性与可靠raw bunch的序列号）
+    |bPartial|bPartialInitial|bPartialFinal|（是否分包，首or尾）
+
+    把头部和bunch的数据都push到SendBuffer（WriteBitsToSendBufferInternal），记录并返回PacketId。
+    FlushNet的时候就会把SendBuffer中的数据通过LowLevelSend调用底层socket发出去。
 
 ### 收端
 
-3.`UNetConnection::ReceivedRawPacket`：此时收端通过StatelessConnectHandlerComponent::Incoming处理握手、校验、加密、压缩（并没有看懂），解析并构造FBitReader，在ReceivedPacket中真正处理Packet。
+3.`UNetConnection::ReceivedRawPacket`：
+    此时收端通过StatelessConnectHandlerComponent::Incoming处理握手、校验、加密、压缩，解析并构造FBitReader，在ReceivedPacket中真正处理Packet。
 
 4.`UNetConnection::ReceivedPacket`:首先，通过ReadHeader解析Packet中的包头，通过包头的序列号减去上次收包的序列号得出packet序列号增量，判断有没有丢包、是否由于底层的原因收到了历史的包(丢弃即可)。
 如果发现有丢失的packet（1<序列号增量<=MaxMissingPackets），虽然bunch有缓存等待丢失bunch重发的机制，但是可能是因为udp乱序比较频繁，这里会将丢失packet存到PacketOrderCache，之后会通过FlushPacketOrderCache检查并将收到的packet按顺序通过ReceivedPacket处理。假如没有丢包，直接进入解析packet的流程(5)。（PacketNotify分析收到AckNak信息的过程之后在发端介绍(8)）
