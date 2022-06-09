@@ -1,6 +1,15 @@
 # Movement
 
 ``` c++
+
+CalculateInput()
+    MovementComponent::AddInputVector()
+
+CharacterMovementComponent::TickComponent()
+    FVector InputVector = ConsumeInputVector()
+    ScaleInputAcceleration()//apply input to acceleration
+
+    //
 PerformMovement()
     PhysWalking()
         //准备好comsumeInput得出的加速度

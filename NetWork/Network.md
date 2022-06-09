@@ -22,14 +22,67 @@ Bunch 序列号是每个通道的，每发送一个可靠 Bunch 就递增它的 
 这也就说明 __可靠性是在Bunch这一层面上的__ 。
 接下来介绍一下UE4底层网络包如何实现可靠性。
 
-要点：Partial、Reliable、
+要点：Partial、Reliable。
+
+``` c++
+class UChannel {
+    int32 ChIndex; // Index of this channel.
+    FPacketIdRange OpenPacketId;        // If OpenedLocally is true, this is the packet we sent the bOpen bunch on. Otherwise, it's the packet we received the bOpen bunch on.
+    FName ChName; // Name of the type of this channel.
+    int32 NumInRec; // Number of packets in InRec.
+    int32 NumOutRec; // Number of packets in OutRec.
+    class FInBunch* InRec; // 指向可靠的前面还有bunch没收到的乱序bunch缓存队列头部
+    class FOutBunch* OutRec; // 指向可靠的待ack的outbunch链表头部
+}
+
+class UNetConnection {
+    //收到乱序packet的环形缓冲区
+    TOptional<TCircularBuffer<TUniquePtr<FBitReader>>> PacketOrderCache;
+
+    /** The current start index for PacketOrderCache */
+    int32 PacketOrderCacheStartIdx;
+
+    /** The current number of valid packets in PacketOrderCache */
+    int32 PacketOrderCacheCount;
+
+    FNetPacketNotify PacketNotify;//实现可靠的序列数据
+
+    FWrittenChannelsRecord //记录通道发送的消息包ID，通道索引。主要应用于处理可靠包重传。
+
+    OutReliable //每一个通道发送可靠包的序列号列表。
+
+    InReliable //每一个通道接收可靠包的序列号列表。
+    FInBunch* InRec //接收的列表
+
+    FOutBunch* OutRec //发送的列表
+    FInBunch* InPartialBunch //接收的部分包的列表
+}
+
+class FNetPacketNotify {
+    SequenceNumberT InSeq; //从远程接收的最后的序列号并接受
+
+    SequenceNumberT InAckSeq; //从远程接收的最后的序列号，我们已经确认。这是必须的，我们支持接受数据包，但不显示的地在接收时确认它，在处理完接收包后处理。
+
+    SequenceNumberT InAckSeqAck; //从远程接收的最后的序列号，我们已经确认。并且知道远程已经收到确认序列号。
+
+    SequenceNumberT OutSeq; //发送给序列号。
+
+    SequenceNumberT OutAckSeq; //发送确认序列号，我们知道远程已经接收到。
+
+    SIZE_T WrittenHistoryWordCount; //准备发送历史接收包确认状态的个数，发送之前计算。
+
+    SequenceHistoryT InSeqHistory; //历史接收包的确认状态，用于告诉对方，我们收到包并且确认了。
+
+    AckRecordT AckRecord; //发送每一个数据包时，要记录发送数据包的OutSeq和InAckSeq.
+}
+```
 
 ### 发端
 
 1.`UChannel::SendBunch`:
     首先channel和可靠性相同，并且允许合并的小bunch可以合并，节省bunch头部的消耗。然后需要将过大的的Bunch切分成partial bunch，经过合并切分处理的bunch，暂且称之为raw bunch。
     把处理过的raw bunch放到OutgoingBunches数组中。接下来可靠也是建立在raw bunch这一层面上的。
-    接下来遍历OutgoingBunches数组，同步partial信息用于收端还原完整bunch，通过PrepBunch把可靠的raw bunch塞到(FOutBunch**)OutRec链表（指向可靠待ack的outbunch链表头部）的末尾，用于在丢包的时候重新发送，并分配ChSequence（可靠的raw bunch递增的序列号）。
+    接下来遍历OutgoingBunches数组，同步partial信息用于收端还原完整bunch，通过PrepBunch把可靠的raw bunch塞到OutRec链表（指向可靠待ack的outbunch链表头部）的末尾，用于在丢包的时候重新发送，并分配ChSequence（可靠的raw bunch递增的序列号）。
     通过SendRawBunch将所有的raw bunch添加头部信息再发出去，并且记录PacketId的范围并返回（原始bunch可能会拆分到不同的packet）。
 
 2.`UNetConnection::SendRawBunch`：
@@ -39,24 +92,28 @@ Bunch 序列号是每个通道的，每发送一个可靠 Bunch 就递增它的 
     |ChIndex|ChName|（通道索引与名称）
     |bReliable|ChSequence|（可靠性与可靠raw bunch的序列号）
     |bPartial|bPartialInitial|bPartialFinal|（是否分包，首or尾）
-
     把头部和bunch的数据都push到SendBuffer（WriteBitsToSendBufferInternal），记录并返回PacketId。
     FlushNet的时候就会把SendBuffer中的数据通过LowLevelSend调用底层socket发出去。
 
 ### 收端
 
 3.`UNetConnection::ReceivedRawPacket`：
-    此时收端通过StatelessConnectHandlerComponent::Incoming处理握手、校验、加密、压缩，解析并构造FBitReader，在ReceivedPacket中真正处理Packet。
+    此时收端通过StatelessConnectHandlerComponent::Incoming处理握手、校验、加密、压缩，解析并构造FBitReader，在ReceivedPacket中处理收到Packet的顺序，调用FlushPacketOrderCache处理PacketOrderCache中有前面序不缺失的packet。
 
-4.`UNetConnection::ReceivedPacket`:首先，通过ReadHeader解析Packet中的包头，通过包头的序列号减去上次收包的序列号得出packet序列号增量，判断有没有丢包、是否由于底层的原因收到了历史的包(丢弃即可)。
-如果发现有丢失的packet（1<序列号增量<=MaxMissingPackets），虽然bunch有缓存等待丢失bunch重发的机制，但是可能是因为udp乱序比较频繁，这里会将丢失packet存到PacketOrderCache，之后会通过FlushPacketOrderCache检查并将收到的packet按顺序通过ReceivedPacket处理。假如没有丢包，直接进入解析packet的流程(5)。（PacketNotify分析收到AckNak信息的过程之后在发端介绍(8)）
-接下来会解析分发packet中所有的raw bunch。确定当前raw bunch的其起始位置，解析还原出PacketId,bReliable,ChIndex,bPartial等信息。根据ChIndex找到对应的channel(找不到可能会创建Chanel)，调用ReceivedRawBunch。
+4.`UNetConnection::ReceivedPacket`:
+    首先，通过FNetPacketNotify::WriteHeader解析Packet中的包头（包含Seq、AckedSeq、History），通过包头的序列号减去上次收包的序列号（InSeq）得出packet序列号增量，判断有没有丢包、是否由于底层的原因收到了历史的包(丢弃即可)。
+    如果发现有丢包（1<序列号增量<=MaxMissingPackets），虽然bunch有缓存等待丢失bunch重发的机制，但是可能是因为udp乱序比较频繁，这里会将丢失packet存到PacketOrderCache（TCircularBuffer<TUniquePtr<FBitReader>>）。具体的存储位置在不超过缓冲区大小时，就是缓冲区的起始位置+序列号增量，保证packet顺序。
+    假如没有丢包，直接进入解析packet的流程(5)。（PacketNotify分析收到AckNak信息的过程之后在发端介绍(8)）
+    接下来会解析分发packet中所有的raw bunch。确定当前raw bunch的其起始位置，解析还原出PacketId,bReliable,ChIndex,bPartial等信息。根据ChIndex找到对应的channel(找不到可能会创建Chanel)，调用ReceivedRawBunch。
 
-5.`UChannel::ReceivedRawBunch`如果raw bunch可靠，并且不是下一个待接受的raw bunch序列号，则需要缓存到InRec等待前面的raw bunch。如果不可靠，或者确实是按顺序收到的，则直接进入ReceivedNextBunch进一步处理处理。
+5.`UChannel::ReceivedRawBunch`：
+    如果raw bunch可靠，并且不是下一个待接受的raw bunch序列号，则需要缓存到InRec等待前面的raw bunch。如果不可靠，或者确实是按顺序收到的，则直接进入ReceivedNextBunch进一步处理处理。
 
-6.`UChannel::ReceivedNextBunch`：处理按顺序进Channel的raw bunch， __这一步进来的都是顺序正确的raw bunch__ 。如果是可靠的Bunch，则更新该Channel可靠bunch序列号。如果来包是PartialBunch的第一个包，就复制构造到InPartialBunch，之后来的部分都合入InPartialBunch(AppendDataFromChecked)。
-为了合成正确的完整Bunch，这里还需要确保partial bunch的顺序。如果是可靠的partial bunch，那么它的序列号应该是InPartialBunch+1，如果是不可靠的partial bunch，由于不可靠bunch使用的序列号就是packet的序列号，那么他的序列号应该与InPartialBunch相同，这一步就可以保证合成整bunch的正确性。
-如果顺利接收merge入了最后一个PartialBunch，此时已经有了完成的bunch，可以执行ReceivedSequencedBunch&ReceivedBunch进行具体的处理。否则将会丢弃这个raw bunch，如果是可靠的bunch，将会通过设置bOutSkipAck为true，标记包含这个raw bunch的packet为nak，之后发端将重新发送这个packet中的所有可靠raw bunch。
+6.`UChannel::ReceivedNextBunch`：
+    处理按顺序进Channel的raw bunch， __这一步进来的都是顺序正确的raw bunch__ 。如果是可靠的Bunch，则更新该Channel可靠bunch序列号。如果来包是PartialBunch的第一个包，就复制构造到InPartialBunch，之后来的部分都合入InPartialBunch(AppendDataFromChecked)。
+    为了合成正确的完整Bunch，这里还需要确保partial bunch的顺序。如果是可靠的partial bunch，那么它的序列号应该是InPartialBunch+1，如果是不可靠的partial bunch，由于不可靠bunch使用的序列号就是packet的序列号，那么他的序列号应该与InPartialBunch相同，这一步就可以保证合成整bunch的正确性。
+    如果顺利接收merge入了最后一个PartialBunch，此时已经有了完成的bunch，可以执行ReceivedSequencedBunch&ReceivedBunch进行具体的处理。否则将会丢弃这个raw bunch，如果是可靠的bunch，将会通过设置bOutSkipAck为true，标记包含这个raw bunch的packet为nak，之后发端将重新发送这个packet中的所有可靠raw bunch。
+
 (接下来就是`ReceivedBunch`&`ProcessBunch`的部分)
 
 7.回到UNetConnection::ReceivedPacket，这里会根据channel设置的bSkipAck将ack/nak信息通过FNetPacketNotify::AckSeq塞入InSeqHistory。
