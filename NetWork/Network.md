@@ -4,7 +4,9 @@
 
 ## UE4网络基本通信架构
 
-![a](./Img/img02.png)
+### 基本概念介绍
+
+![a](https://pic1.zhimg.com/v2-72448dadb314ae0f3f34d98884d4b588_r.jpg)
 这是Jerish大佬画的图，基本解释了Connection和Channel的概念，Connection相当于客户端与服务器实际的会话连接，Channel相当于同步具体Actor、Controller信息的通道。
 
 了解了ue4网络同步的基本架构，大致可以自顶向下分为三大部分。
@@ -19,43 +21,41 @@ Packets 是在Connection上发送的数据块。
 Bunches 是在Channel上发送的数据块。
 一个 Packet 可以不包含 Bunch、单个 Bunch 或者多个 Bunch。当一个 Bunch 太大时，在传输之前，我们会把它切成许多小 Bunch，这些 Bunch 将被标记为 PartialInitial, Partial 或 PartialFinal。利用这些信息，我们可以在接收端重新组装 Bunch。
 Bunch 序列号是每个通道的，每发送一个可靠 Bunch 就递增它的 Bunch 序列号。当Bunch需要重传时，将重新发送具有相同 Bunch 序列号的 Bunch，而Packet是每次都重新组装的，不会缓存Packet重发。
-这也就说明 __可靠性是在Bunch这一层面上的__ 。
+这也就说明 __可靠性是在RawBunch这一层面上的，但判断丢包通过packet__。
 接下来介绍一下UE4底层网络包如何实现可靠性。
 
-要点：Partial、Reliable。
+### 可靠传输过程的重要概念介绍
 
 ``` c++
+/**
+    Channel:
+    在可靠传输的过程中，负责维护本channel上Bunch的可靠传输。
+    因此需要收包缓冲区InRec记录乱序到达的rawbunch，以及发包缓冲区OutRec缓存待ack的rawbunch。
+**/
 class UChannel {
-    int32 ChIndex; // Index of this channel.
     FPacketIdRange OpenPacketId;        // If OpenedLocally is true, this is the packet we sent the bOpen bunch on. Otherwise, it's the packet we received the bOpen bunch on.
-    FName ChName; // Name of the type of this channel.
-    int32 NumInRec; // Number of packets in InRec.
-    int32 NumOutRec; // Number of packets in OutRec.
+
     class FInBunch* InRec; // 指向可靠的前面还有bunch没收到的乱序bunch缓存队列头部
+    int32 NumInRec; // Number of packets in InRec.
     class FOutBunch* OutRec; // 指向可靠的待ack的outbunch链表头部
+    int32 NumOutRec; // Number of packets in OutRec.
+    FInBunch* InPartialBunch //接收的部分包的列表
 }
 
+/**
+    NetConnection:
+    Connection负责Packet这一层面上的传输，重发发的是rawbunch而不是Packet，因此只需要一个收Packet的环形缓冲区，定时Flush缓冲区处理收到的Packet即可。
+    因此判断丢包也是在Packet这一层，所以当Connection发现丢失了Packet，需要通知到上层Channel该丢失的Packet都包含哪些RawBunch，进行重发。
+**/
 class UNetConnection {
-    //收到乱序packet的环形缓冲区
+    //收到packet的环形缓冲区
     TOptional<TCircularBuffer<TUniquePtr<FBitReader>>> PacketOrderCache;
+    int32 PacketOrderCacheStartIdx;//缓冲区起始位
+    int32 PacketOrderCacheCount;//缓冲区长度
 
-    /** The current start index for PacketOrderCache */
-    int32 PacketOrderCacheStartIdx;
-
-    /** The current number of valid packets in PacketOrderCache */
-    int32 PacketOrderCacheCount;
+    FWrittenChannelsRecord ChannelRecord;//记录通道发送的消息包ID，通道索引。主要应用于处理可靠包重传。
 
     FNetPacketNotify PacketNotify;//实现可靠的序列数据
-
-    FWrittenChannelsRecord //记录通道发送的消息包ID，通道索引。主要应用于处理可靠包重传。
-
-    OutReliable //每一个通道发送可靠包的序列号列表。
-
-    InReliable //每一个通道接收可靠包的序列号列表。
-    FInBunch* InRec //接收的列表
-
-    FOutBunch* OutRec //发送的列表
-    FInBunch* InPartialBunch //接收的部分包的列表
 }
 
 class FNetPacketNotify {
@@ -77,15 +77,18 @@ class FNetPacketNotify {
 }
 ```
 
-### 发端
+### 可靠传输流程
 
-1.`UChannel::SendBunch`:
+#### 发端发包
+
+1. `UChannel::SendBunch`:
+    ____
     首先channel和可靠性相同，并且允许合并的小bunch可以合并，节省bunch头部的消耗。然后需要将过大的的Bunch切分成partial bunch，经过合并切分处理的bunch，暂且称之为raw bunch。
     把处理过的raw bunch放到OutgoingBunches数组中。接下来可靠也是建立在raw bunch这一层面上的。
     接下来遍历OutgoingBunches数组，同步partial信息用于收端还原完整bunch，通过PrepBunch把可靠的raw bunch塞到OutRec链表（指向可靠待ack的outbunch链表头部）的末尾，用于在丢包的时候重新发送，并分配ChSequence（可靠的raw bunch递增的序列号）。
     通过SendRawBunch将所有的raw bunch添加头部信息再发出去，并且记录PacketId的范围并返回（原始bunch可能会拆分到不同的packet）。
 
-2.`UNetConnection::SendRawBunch`：
+2. `UNetConnection::SendRawBunch`：
     为raw bunch建立头部，包括Reliable、Partial等信息，以下是raw bunch头部（SendBunchHeader）主要信息（可能不会全进头部）:
     |bOpen|Close|CloseReason|（channel开关）
     |bIsReplicationPaused|（暂停复制）
@@ -95,21 +98,21 @@ class FNetPacketNotify {
     把头部和bunch的数据都push到SendBuffer（WriteBitsToSendBufferInternal），记录并返回PacketId。
     FlushNet的时候就会把SendBuffer中的数据通过LowLevelSend调用底层socket发出去。
 
-### 收端
+#### 收端收包
 
-3.`UNetConnection::ReceivedRawPacket`：
+3. `UNetConnection::ReceivedRawPacket`：
     此时收端通过StatelessConnectHandlerComponent::Incoming处理握手、校验、加密、压缩，解析并构造FBitReader，在ReceivedPacket中处理收到Packet的顺序，调用FlushPacketOrderCache处理PacketOrderCache中有前面序不缺失的packet。
 
-4.`UNetConnection::ReceivedPacket`:
+4. `UNetConnection::ReceivedPacket`:
     首先，通过FNetPacketNotify::WriteHeader解析Packet中的包头（包含Seq、AckedSeq、History），通过包头的序列号减去上次收包的序列号（InSeq）得出packet序列号增量，判断有没有丢包、是否由于底层的原因收到了历史的包(丢弃即可)。
     如果发现有丢包（1<序列号增量<=MaxMissingPackets），虽然bunch有缓存等待丢失bunch重发的机制，但是可能是因为udp乱序比较频繁，这里会将丢失packet存到PacketOrderCache（TCircularBuffer<TUniquePtr<FBitReader>>）。具体的存储位置在不超过缓冲区大小时，就是缓冲区的起始位置+序列号增量，保证packet顺序。
     假如没有丢包，直接进入解析packet的流程(5)。（PacketNotify分析收到AckNak信息的过程之后在发端介绍(8)）
     接下来会解析分发packet中所有的raw bunch。确定当前raw bunch的其起始位置，解析还原出PacketId,bReliable,ChIndex,bPartial等信息。根据ChIndex找到对应的channel(找不到可能会创建Chanel)，调用ReceivedRawBunch。
 
-5.`UChannel::ReceivedRawBunch`：
+5. `UChannel::ReceivedRawBunch`：
     如果raw bunch可靠，并且不是下一个待接受的raw bunch序列号，则需要缓存到InRec等待前面的raw bunch。如果不可靠，或者确实是按顺序收到的，则直接进入ReceivedNextBunch进一步处理处理。
 
-6.`UChannel::ReceivedNextBunch`：
+6. `UChannel::ReceivedNextBunch`：
     处理按顺序进Channel的raw bunch， __这一步进来的都是顺序正确的raw bunch__ 。如果是可靠的Bunch，则更新该Channel可靠bunch序列号。如果来包是PartialBunch的第一个包，就复制构造到InPartialBunch，之后来的部分都合入InPartialBunch(AppendDataFromChecked)。
     为了合成正确的完整Bunch，这里还需要确保partial bunch的顺序。如果是可靠的partial bunch，那么它的序列号应该是InPartialBunch+1，如果是不可靠的partial bunch，由于不可靠bunch使用的序列号就是packet的序列号，那么他的序列号应该与InPartialBunch相同，这一步就可以保证合成整bunch的正确性。
     如果顺利接收merge入了最后一个PartialBunch，此时已经有了完成的bunch，可以执行ReceivedSequencedBunch&ReceivedBunch进行具体的处理。否则将会丢弃这个raw bunch，如果是可靠的bunch，将会通过设置bOutSkipAck为true，标记包含这个raw bunch的packet为nak，之后发端将重新发送这个packet中的所有可靠raw bunch。
@@ -137,9 +140,9 @@ UNetConnection::ReceivedPacket(...)
 }
 ```
 
-### 发端处理ack/nak
+#### 发端处理ack/nak
 
-8.`FNetPacketNotify::ProcessReceivedAcks`：ack信息回到发端
+8. `FNetPacketNotify::ProcessReceivedAcks`：ack信息回到发端
 
 ``` c++
 // UNetConnection::ReceivedPacket
@@ -199,22 +202,6 @@ void UChannel::ReceivedNak( int32 NakPacketId )
     }
 }
 ```
-
-[UE4 UDP是如何进行可靠传输的_Jerish的博客-CSDN博客](https://blog.csdn.net/u012999985/article/details/117236770)
-FNetPacketNotify::ProcessReceivedAcks
-如果收到nak则会将outrec中packetid相同的raw bunch全部重新发送一遍。
-![图片描述](/tfl/captures/2021-12/tapd_personalword_1100000000000459405_base64_1639572466_6.png)
-
-### 发数据流程
-
-![图片描述](/tfl/captures/2021-11/tapd_personalword_1100000000000459405_base64_1636308817_84.png)
-![图片描述](/tfl/captures/2021-11/tapd_personalword_1100000000000459405_base64_1636308848_100.png)
-
-### 收数据流程
-
-![图片描述](/tfl/captures/2021-11/tapd_personalword_1100000000000459405_base64_1636308555_31.png)
-![图片描述](/tfl/captures/2021-11/tapd_personalword_1100000000000459405_base64_1636308610_88.png)
-以上是ue4底层实现可靠udp的内容，接下来介绍网络模块结合UE4游戏框架的部分。
 
 ## Actor同步流程
 
