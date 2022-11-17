@@ -625,7 +625,7 @@ void FRepLayout::UpdateUnmappedObjects_r(FGuidReferencesMap* GuidReferencesMap..
             // Initialize the reader with the stored buffer that we need to read from
             FNetBitReader Reader( PackageMap, GuidReferences.Buffer.GetData(), GuidReferences.NumBufferBits );
             // Read the property更新Data中的数据
-            Cmd.Property->NetSerializeItem( Reader, PackageMap, Data + AbsOffset );
+            Cmd.Property->NetSerializeItem( Reader, PackageMap, Data + NewbieGuideManagerAbsOffset );
             // Check to see if this property changed
             //比较StoredData和Data，发现属性改变或者REPNOTIFY_Always
             if ( Parent.RepNotifyCondition == REPNOTIFY_Always || !PropertiesAreIdentical( Cmd, StoredData + AbsOffset, Data + AbsOffset ) )
@@ -644,7 +644,7 @@ void FRepLayout::CallRepNotifies( FRepState * RepState, UObject* Object ) const
     {
         UProperty * RepProperty = RepState->RepNotifies[i];
         UFunction * RepNotifyFunc = Object->FindFunction( RepProperty->RepNotifyFunc );
-        Object->ProcessEvent( RepNotifyFunc,...）
+        Object->ProcessEvent(RepNotifyFunc,...)
     }
 }
 ```
