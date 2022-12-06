@@ -82,7 +82,6 @@ class FNetPacketNotify {
 #### 发端发包
 
 1. `UChannel::SendBunch`:
-    ____
     首先channel和可靠性相同，并且允许合并的小bunch可以合并，节省bunch头部的消耗。然后需要将过大的的Bunch切分成partial bunch，经过合并切分处理的bunch，暂且称之为raw bunch。
     把处理过的raw bunch放到OutgoingBunches数组中。接下来可靠也是建立在raw bunch这一层面上的。
     接下来遍历OutgoingBunches数组，同步partial信息用于收端还原完整bunch，通过PrepBunch把可靠的raw bunch塞到OutRec链表（指向可靠待ack的outbunch链表头部）的末尾，用于在丢包的时候重新发送，并分配ChSequence（可靠的raw bunch递增的序列号）。
@@ -650,3 +649,30 @@ void FRepLayout::CallRepNotifies( FRepState * RepState, UObject* Object ) const
 ```
 
 所以之后属性引用的Object同步过来之后会调OnRep吗？PropertiesAreIdentical可能比较GUID还是相同的，所以可能不会调用。但是如果设置成REPNOTIFY_Always的话就都会调用了，感觉可以解决以先断线重连时序问题。
+
+------1.组内版本开发任务
+经典模块的重构推进：推进结算新框架的UI重构与功能迁移，确保新框架以及结算相关功能正常上线，添加后台开关并尽量确保外网不出现重大问题。
+经典UI需求：对于负责的经典UI模块，包括结算、观战、雕像、喷漆面板以及其他负责的经典UI，进行新需求的估时与方案的制订，控制开发期bug数量。注意开发规范，尽量确保不新增安全问题与外网重大问题。
+Mod玩法需求：对于负责的Mod玩法的开发需求，严格遵守Mod开发规范，合理估时按时交付，尽量确保外网不出现重大问题。
+
+对于结算的新框架重构，接手结算新框架进行了完整的review并完善，完成结算框架wiki与规范并分享。组织参与结算开发的同学有序把旧版本的功能迁移到新框架并reivew代码，积极推进重构并修复问题。进行性能测试与优化，解决一些结算流程的历史问题。上线后外网无严重问题，目前旧结算流程已完全废弃。（结算相关wiki集合：https://iwiki.woa.com/pages/viewpage.action?pageId=1835116923）
+对于经典UI需求的开发，完成了结算夸夸系统、PCOB相关功能优化、局内喷漆表情UI、局内点赞机制重构、出生岛战绩炫耀以及一些结算优化功能的支持，外网无严重问题。
+对于Mod玩法需求，完成了亚运会PCOB透明地图合入、世界杯结算举杯功能等Mod玩法需求，外网无严重问题。
+
+------2.通用机制与经典模块的维护与优化
+经典模块优化：梳理目前的结算流程，包括结算数据统计、死亡和精彩回放流程、结算前观战流程。挖掘整理优化点，后续安排时间进行持续的优化。对于PCOB也持续进行梳理，发掘优化点并尽量安排优化工作。
+UI机制维护：持续维护并优化通用屏幕标记、通用血条，提供方便的配置与使用接口以及详细的wiki，保证易用性扩展性。
+
+对于结算优化，分析了经典结算流程中的性能与内存，主要通过分帧、异步预加载、结算分阶段加载释放资源等手段进行优化（https://iwiki.woa.com/pages/viewpage.action?pageId=1985127611）。调查并规划了后续的结算优化项（https://iwiki.woa.com/pages/viewpage.action?pageId=4007013332），对于结算的测试流程也进行了一些完善和优化。对于PCOB主要进行了一些UI的lua化，合入了一些国服观战的操作方式，对于中文流做了一些支持。
+对于UI机制维护，优化了屏幕标记的遮挡检测逻辑、血条锥形区域的检测逻辑，以及一些配置项的优化，并及时更新到Wiki与策划同步。
+
+------3.个人能力成长
+网络模块学习：持续学习引擎网络模块，通过源码深入学习观战、客户端与ds的录制与回放流程，理解底层原理与设计思路。
+观战&Replay的学习：看源码学习观战与回放的底层原理，学习并理解项目中观战、回放模块的设计与实现。
+slua的学习与使用：整理slua学习笔记并持续学习slua的实现，总结日常使用slua开发的注意事项与规范，开发功能过程中关注lua的性能指定实现方式。
+wiki的整理与分享：对于新结算框架的设计思路与基本流程进一步整理，列出新框架对于结算整体流程的优化点，并详细说明结算功能的开发方法，在组内进行分享。
+
+通过虚幻4.26版本源码，对于网络模块进行了持续学习，并按照actor与连接的相关性、属性同步与RPC、Bunch的可靠传输过程三个部分进行了总结（https://iwiki.woa.com/pages/viewpage.action?pageId=1971609459）。
+对于回放系统，主要学习了回放系统的架构与数据存储形式，学习了录制、播放CheckPoint和Stream的关键流程，并整理了学习笔记。并且学习了项目中回放相关Wiki，与观战Replay系统基础与规范的ppt（https://iwiki.woa.com/pages/viewpage.action?pageId=4007275510）。
+对于slua主要通过源码和组内分享ppt学习，也有持续整理笔记（https://iwiki.woa.com/pages/viewpage.action?pageId=1985149175）。
+对于结算框架的Wiki整理，主要介绍了结算框架的架构与主要流程、开发规范、测试方法等等（https://iwiki.woa.com/pages/viewpage.action?pageId=1835116923）。

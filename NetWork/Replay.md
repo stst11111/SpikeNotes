@@ -411,3 +411,16 @@ bool UDemoNetDriver::LoadCheckpoint(const FGotoResult& GotoResult)
     ProcessAllPlaybackPackets();
 }
 ```
+
+## 开始录像
+
+``` c++
+ UGameInstance::StartRecordingReplay
+    UDemoNetDriver::InitListen
+        //创建DemoNetConnection初始化，并添加到ClientConnections
+        //创建FInMemoryReplay（管理所有replay数据），初始化FileAr（用于存Packet）
+        FInMemoryNetworkReplayStreamer::StartStreaming
+        //生成SpectatorController绑定Connection
+        UDemoNetDriver::SpawnDemoRecSpectator
+
+```

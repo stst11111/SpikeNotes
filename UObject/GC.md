@@ -14,15 +14,12 @@ void PerformReachabilityAnalysis()
     (this->*MarkObjectsFunctions[GetGCFunctionIndex(!bForceSingleThreaded, bWithClusters)])(ObjectsToSerialize, KeepFlags);
     //3.分析可达性
     PerformReachabilityAnalysisOnObjects(ArrayStruct, bForceSingleThreaded, bWithClusters);
-    }
 }
 ```
 
 MarkObjectsAsUnreachable：
-
 每个线程平均分配NumObjects个uobject，遍历该线程负责的所有obj。
 
-代码块
 第三步，调用PerformReachabilityAnalysisOnObjects来判断uobject可达性
 
 ``` c++
